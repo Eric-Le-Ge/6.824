@@ -24,6 +24,41 @@ type ExampleReply struct {
 
 // Add your RPC definitions here.
 
+type TaskType string
+
+const(
+	Map TaskType = "Map"
+	Reduce = "Reduce"
+	Exit = "Exit"
+)
+
+type AssignmentArgs struct { }
+
+type AssignmentReply struct {
+	// Type of the task, one of "Map", "Reduce", "Exit"
+	TaskType TaskType
+	// Filename of the Map task, used when a task is Map.
+	MapFile string
+	// Id of the Map task, used when a task is Map.
+	MapId int
+	// Total amount of Map tasks, used when a task is Reduce,
+	// to retrieve all intermediate files of name mr-{MapId}-{ReduceId}
+	// for MapId in [0, MapCount).
+	MapCount int
+	// Id of the Reduce task, used when a task is Reduce.
+	ReduceId int
+	// Total amount of Reduce tasks, used a task is Map.
+	ReduceCount int
+}
+
+type ReportCompleteArgs struct {
+	// Type of the task, one of "Map", "Reduce"
+	TaskType TaskType
+	// Id of the Task
+	TaskId int
+}
+
+type ReportCompleteReply struct { }
 
 // Cook up a unique-ish UNIX-domain socket name
 // in /var/tmp, for the master.
