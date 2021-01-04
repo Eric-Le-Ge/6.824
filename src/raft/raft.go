@@ -37,13 +37,13 @@ const(
 
 const NotVoted = -1
 // election time out. Paper uses 150-300ms, for this assignment we try a larger number
-const ElectionTimeOutMin = 600
-const ElectionTimeOutMax = 1000
+const ElectionTimeOutMin = 500
+const ElectionTimeOutMax = 800
 // a small amount added to avoid precision error in timer.sleep, which might cause an
 // extra time out interval to be waited.
 const TimeOutResetEps = 10
 // time elapsed between each AppendEntry
-const AppendEntryInterval = 200
+const AppendEntryInterval = 100
 
 //
 // as each Raft peer becomes aware that successive log entries are
@@ -168,9 +168,18 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.currentTerm = args.Term
 		reply.VoteGranted = true
 		rf.votedFor = args.CandidateId
+		if rf.state == Leader {
+			rf.state = Follower
+			go rf.operateFollower()
+		} else if rf.state == Candidate {
+			rf.state = Follower
+		}
+		rf.latestReset = time.Now()
 		DPrintf("Vote granted from %v to %v", rf.me, args.CandidateId)
 	} else if args.Term == rf.currentTerm && (rf.votedFor == NotVoted || rf.votedFor == args.CandidateId){
 		reply.VoteGranted = true
+		rf.votedFor = args.CandidateId
+		rf.latestReset = time.Now()
 		DPrintf("Vote granted from %v to %v", rf.me, args.CandidateId)
 	} else {
 		reply.VoteGranted = false
@@ -325,6 +334,7 @@ func randElectionWaitTime() time.Duration {
 func (rf *Raft) operateFollower() {
 	timeToWait := randElectionWaitTime()
 	rf.mu.Lock()
+	rf.latestReset = time.Now()
 	defer rf.mu.Unlock()
 	for !rf.killed() && rf.state == Follower {
 		// wait at the beginning of the function since we want a timeout
@@ -339,12 +349,12 @@ func (rf *Raft) operateFollower() {
 			for rf.state == Candidate {
 				DPrintf("%v starts election at term %v", rf.me, rf.currentTerm)
 				rf.kickOffElection()
-				if rf.state != Candidate {
-					break
-				}
-				rf.mu.Unlock()
-				time.Sleep(randElectionWaitTime())
-				rf.mu.Lock()
+				//if rf.state != Candidate {
+				//	break
+				//}
+				//rf.mu.Unlock()
+				//time.Sleep(randElectionWaitTime())
+				//rf.mu.Lock()
 			}
 		}
 		timeToWait = randElectionWaitTime()
@@ -356,6 +366,7 @@ var callNo = 0
 // goroutine for leaders. Send AppendEntries periodically.
 //
 func (rf *Raft) operateLeader() {
+	time.Sleep(AppendEntryInterval * time.Millisecond)
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	for !rf.killed() && rf.state == Leader {
@@ -367,11 +378,9 @@ func (rf *Raft) operateLeader() {
 			}
 			go func(i int) {
 				reply := AppendEntriesReply{}
-				thisCallNo := callNo
 				callNo ++
-				DPrintf("%v sends AppendEntry to %v [%v]", rf.me, i, thisCallNo)
+				DPrintf("%v sends AppendEntry to %v", rf.me, i)
 				ok := rf.sendAppendEntries(i, &AppendEntriesArgs{term, rf.me}, &reply)
-				DPrintf("%v sent AppendEntry to %v, status %v [%v]", rf.me, i, ok, thisCallNo)
 				if ok {
 					rf.mu.Lock()
 					if rf.state == Leader && rf.currentTerm < reply.Term {
@@ -395,7 +404,6 @@ func  (rf *Raft) kickOffElection() {
 	rf.votedFor = rf.me
 	votesNeeded := len(rf.peers) / 2
 	term := rf.currentTerm
-	rf.mu.Unlock()
 	c := make(chan bool)
 	for i:=0; i<len(rf.peers); i++ {
 		if i == rf.me {
@@ -412,17 +420,19 @@ func  (rf *Raft) kickOffElection() {
 			c <- ok && reply.VoteGranted
 		} (i)
 	}
-	votesReceived, votesProcessed := 0, 0
+	rf.mu.Unlock()
+	votesReceived := 0
 	done := false
+	electionExpires := time.After(randElectionWaitTime())
 	for i:=0;i<len(rf.peers)-1;i++ {
 		select {
 			case vote := <-c: {
 				if vote {
 					votesReceived++
 				}
-				done = votesReceived >= votesNeeded || votesProcessed == len(rf.peers) - 1
+				done = votesReceived >= votesNeeded
 			}
-			case <- time.After(randElectionWaitTime()):
+			case <- electionExpires:
 				done = true
 		}
 		if done {
@@ -441,7 +451,7 @@ func  (rf *Raft) kickOffElection() {
 	//	}
 	//}
 	rf.mu.Lock()
-	if votesReceived >= votesNeeded && rf.state == Candidate {
+	if votesReceived >= votesNeeded && rf.state == Candidate && rf.currentTerm == term{
 		DPrintf("%v elected leader", rf.me)
 		rf.state = Leader
 		go rf.operateLeader()
@@ -471,7 +481,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.state = Follower
 	rf.currentTerm = 0
 	rf.votedFor = NotVoted
-	rf.latestReset = time.Now()
 
 	go rf.operateFollower()
 	DPrintf("%v started", rf.me)
