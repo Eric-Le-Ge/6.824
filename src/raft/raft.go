@@ -251,6 +251,15 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
+//
+// reason for rejecting an AppendEntry. Used for optimization
+//
+type RejectAppendReason string
+const (
+	ByTerm RejectAppendReason = "ByTerm"
+	ByConflict = "ByConflict"
+	ByLength = "ByLength"
+)
 
 //
 // AppendEntry RPC arguments structure.
@@ -272,6 +281,11 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
+	// optimizations for fast backup.
+	RejectReason RejectAppendReason
+	RejectionIndex int
+	RejectionTerm int
+	RejectionLength int
 }
 
 //
@@ -285,6 +299,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		reply.Success = false
+		reply.RejectReason = ByTerm
 		DPrintf("%v rejected AppendEntry from %v", rf.me, args.LeaderId)
 		return
 	}
@@ -293,6 +308,16 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		args.PrevLogIndex > len(rf.log) || rf.log[args.PrevLogIndex-1].CommandTerm != args.PrevLogTerm) {
 		reply.Term = rf.currentTerm
 		reply.Success = false
+		if args.PrevLogIndex > len(rf.log) {
+			reply.RejectReason = ByLength
+			reply.RejectionLength = len(rf.log)
+		} else {
+			reply.RejectReason = ByConflict
+			reply.RejectionTerm = rf.log[args.PrevLogIndex-1].CommandTerm
+			reply.RejectionIndex = sort.Search(args.PrevLogIndex, func(i int) bool {
+				return rf.log[i].CommandTerm == rf.log[args.PrevLogIndex-1].CommandTerm
+			}) + 1
+		}
 		DPrintf("%v processed unmatched AppendEntry from %v", rf.me, args.LeaderId)
 		rf.latestReset = time.Now()
 		return
@@ -441,12 +466,11 @@ func (rf *Raft) operateFollower() {
 	}
 }
 
-var callNo = 0
 //
 // goroutine for leaders. Send AppendEntries periodically.
 //
 func (rf *Raft) operateLeader() {
-	time.Sleep(AppendEntryInterval * time.Millisecond)
+	// time.Sleep(AppendEntryInterval * time.Millisecond)
 	rf.mu.Lock()
 	// leader Initialization
 	for i:=0; i<len(rf.peers); i++ {
@@ -456,17 +480,15 @@ func (rf *Raft) operateLeader() {
 			rf.matchIndex[i] = len(rf.log)
 		}
 	}
-
+	term := rf.currentTerm
 	defer rf.mu.Unlock()
-	for !rf.killed() && rf.state == Leader {
-		term := rf.currentTerm
+	for !rf.killed() && rf.state == Leader && rf.currentTerm == term {
 		for i:=0; i<len(rf.peers); i++ {
 			if i == rf.me {
 				continue
 			}
 			go func(i int) {
 				reply := AppendEntriesReply{}
-				callNo ++
 				args := AppendEntriesArgs{}
 				args.Term = term
 				args.LeaderId = rf.me
@@ -474,7 +496,6 @@ func (rf *Raft) operateLeader() {
 				if args.PrevLogIndex != 0 {
 					args.PrevLogTerm = rf.log[args.PrevLogIndex - 1].CommandTerm
 				}
-				// TODO: more log entries
 				args.Entries = make([] Entry, 0)
 				if len(rf.log) >= rf.nextIndex[i] {
 					args.Entries = append(args.Entries, rf.log[rf.nextIndex[i] - 1:]...)
@@ -494,8 +515,17 @@ func (rf *Raft) operateLeader() {
 						rf.nextIndex[i] += len(args.Entries)
 						rf.matchIndex[i] = rf.nextIndex[i] - 1
 					} else {
-						// TODO: Resend AppendEntry?
-						rf.nextIndex[i] --
+						switch reply.RejectReason {
+						case ByTerm: break
+						case ByLength: rf.nextIndex[i] = reply.RejectionLength + 1
+						case ByConflict: {
+							for rf.nextIndex[i] > 1 &&
+								rf.nextIndex[i] > reply.RejectionIndex &&
+								rf.log[rf.nextIndex[i]-2].CommandTerm != reply.RejectionTerm {
+								rf.nextIndex[i] --
+							}
+						}
+						}
 					}
 					rf.mu.Unlock()
 				}
