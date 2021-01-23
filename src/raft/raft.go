@@ -656,12 +656,15 @@ func (rf *Raft) operateCommitAndApply() {
 			}
 		}
 		for rf.lastApplied < rf.commitIndex {
-			DPrintf("%v applied %v, log %v", rf.me, rf.lastApplied, rf.log)
-			rf.applyCh <- ApplyMsg{
+			DPrintf("%v applied %v", rf.me, rf.lastApplied)
+			applyMsg := ApplyMsg{
 				CommandValid: true,
 				Command:      rf.log[rf.lastApplied].Command,
 				CommandIndex: rf.log[rf.lastApplied].CommandIndex,
 			}
+			rf.mu.Unlock()
+			rf.applyCh <- applyMsg
+			rf.mu.Lock()
 			rf.lastApplied ++
 		}
 		rf.mu.Unlock()
