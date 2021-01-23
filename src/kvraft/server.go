@@ -7,9 +7,11 @@ import (
 	"../raft"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
-const Debug = 0
+const Debug = 1
+const PollInterval = 20 * time.Millisecond
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug > 0 {
@@ -35,15 +37,110 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	stateMachine map[string]string // state machine - an in memory map
+	applyIndex int // highest index that has been applied to the state machine
+	clientSerial map[int]int // highest processed serial number of client
 }
 
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	term, isLeader := kv.rf.GetState()
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+	// for get, if it is an old request, there is no need to apply anything to
+	// the log. Read the value immediately
+	if args.SerialNumber <= kv.clientSerial[args.ClientId] {
+		DPrintf("Handled duplicate Read from %v, (serial number %v)", args.ClientId, args.SerialNumber)
+		if val, ok := kv.stateMachine[args.Key]; ok {
+			reply.Err = OK
+			reply.Value = val
+		} else {
+			reply.Err = ErrNoKey
+		}
+		return
+	}
+	index, _, _ := kv.rf.Start(Command{
+		Op:    GetOp,
+		Key:   args.Key,
+		Value: "",
+		SerialNumber: args.SerialNumber,
+		ClientId: args.ClientId,
+	})
+	DPrintf("Started get op, index %v, term %v", index, term)
+	for !kv.killed() {
+		kv.mu.Unlock()
+		time.Sleep(PollInterval)
+		kv.mu.Lock()
+		curTerm, isLeader := kv.rf.GetState()
+		// if leadership information changes, abort call
+		if curTerm != term || !isLeader {
+			reply.Err = ErrWrongLeader
+			return
+		}
+		// get is applied. Read value and report success
+		if kv.applyIndex >= index {
+			reply.Err = OK
+			return
+		}
+		DPrintf("Handled Read from %v, (serial number %v)", args.ClientId, args.SerialNumber)
+		if val, ok := kv.stateMachine[args.Key]; ok {
+			reply.Err = OK
+			reply.Value = val
+		} else {
+			reply.Err = ErrNoKey
+		}
+		return
+	}
+	reply.Err = ErrWrongLeader
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	kv.mu.Lock()
+	defer kv.mu.Unlock()
+	// check the serial number to prevent reapplying a same request.
+	// this is a loose check mainly for performance. request with the same
+	// serial number may still be written two times to the log, however,
+	// correctness will not be affected as the operation with the same serial
+	// number won't be applied twice to the state machine.
+	if args.SerialNumber <= kv.clientSerial[args.ClientId] {
+		reply.Err = ErrOldRequest
+		return
+	}
+	index, term, isLeader := kv.rf.Start(Command{
+		Op:    args.Op,
+		Key:   args.Key,
+		Value: args.Value,
+		SerialNumber: args.SerialNumber,
+		ClientId: args.ClientId,
+	})
+	if !isLeader {
+		reply.Err = ErrWrongLeader
+		return
+	}
+	DPrintf("Started putAppend op, index %v, term %v", index, term)
+	for !kv.killed() {
+		kv.mu.Unlock()
+		time.Sleep(PollInterval)
+		kv.mu.Lock()
+		curTerm, isLeader := kv.rf.GetState()
+		// if leadership information changes, abort call
+		if curTerm != term || !isLeader {
+			reply.Err = ErrWrongLeader
+			return
+		}
+		// putAppend is applied. Report success
+		if kv.applyIndex >= index {
+			reply.Err = OK
+			return
+		}
+	}
+	reply.Err = ErrWrongLeader
 }
 
 //
@@ -68,6 +165,36 @@ func (kv *KVServer) killed() bool {
 }
 
 //
+// a long running go routine that applies messages from ApplyChannel
+//
+func (kv *KVServer) operateApply() {
+	for msg := range kv.applyCh {
+		kv.mu.Lock()
+		cmd := msg.Command.(Command)
+		// TODO (part 3B): add installSnapShot here
+		if msg.CommandValid && cmd.SerialNumber > kv.clientSerial[cmd.ClientId] {
+			kv.clientSerial[cmd.ClientId] = cmd.SerialNumber
+			kv.applyIndex = msg.CommandIndex
+			DPrintf("Applied %s from %v (serial %v) at index %v", cmd.Op, cmd.ClientId, cmd.SerialNumber, msg.CommandIndex)
+			switch cmd.Op {
+			case GetOp:
+				break
+			case AppendOp:
+				if _, ok := kv.stateMachine[cmd.Key]; ok {
+					kv.stateMachine[cmd.Key] += cmd.Value
+				} else {
+					kv.stateMachine[cmd.Key] = cmd.Value
+				}
+			case PutOp:
+				kv.stateMachine[cmd.Key] = cmd.Value
+			}
+		}
+		kv.mu.Unlock()
+		if kv.killed() {return}
+	}
+}
+
+//
 // servers[] contains the ports of the set of
 // servers that will cooperate via Raft to
 // form the fault-tolerant key/value service.
@@ -87,6 +214,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	labgob.Register(Op{})
 
 	kv := new(KVServer)
+	kv.mu.Lock()
 	kv.me = me
 	kv.maxraftstate = maxraftstate
 
@@ -96,6 +224,8 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
+	go kv.operateApply()
+	kv.mu.Unlock()
 
 	return kv
 }
