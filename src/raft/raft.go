@@ -128,7 +128,6 @@ func (rf *Raft) persist() {
 	e.Encode(rf.currentTerm)
 	e.Encode(rf.votedFor)
 	e.Encode(rf.log)
-	DPrintf("%v persisted %v", rf.me, rf.log)
 	data := w.Bytes()
 	rf.persister.SaveRaftState(data)
 }
@@ -236,7 +235,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.votedFor = args.CandidateId
 		rf.latestReset = time.Now()
 		DPrintf("Vote granted from %v to %v", rf.me, args.CandidateId)
-		DPrintf("%v, %v, %v", args.LastLogIndex, args.LastLogTerm, rf.log)
 	} else {
 		reply.VoteGranted = false
 		DPrintf("Vote not granted from %v to %v", rf.me, args.CandidateId)
