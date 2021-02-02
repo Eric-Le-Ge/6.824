@@ -4,6 +4,7 @@ import (
 	"../labgob"
 	"../labrpc"
 	"../raft"
+	"bytes"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -180,25 +181,49 @@ func (kv *KVServer) killed() bool {
 func (kv *KVServer) operateApply() {
 	for msg := range kv.applyCh {
 		kv.mu.Lock()
-		cmd := msg.Command.(Op)
-		// TODO (part 3B): add installSnapShot here
-		if msg.CommandValid && cmd.SerialNumber > kv.clientSerial[cmd.ClientId] {
-			kv.clientSerial[cmd.ClientId] = cmd.SerialNumber
-			kv.applyIndex = msg.CommandIndex
-			DPrintf("Applied %s from %v (serial %v) at index %v", cmd.Op, cmd.ClientId, cmd.SerialNumber, msg.CommandIndex)
-			switch cmd.Op {
-			case GetOp:
-				break
-			case AppendOp:
-				{
-					if _, ok := kv.stateMachine[cmd.Key]; ok {
-						kv.stateMachine[cmd.Key] += cmd.Value
-					} else {
-						kv.stateMachine[cmd.Key] = cmd.Value
+		if !msg.CommandValid {
+			r := bytes.NewBuffer(msg.Command.([]byte))
+			d := labgob.NewDecoder(r)
+			var stateMachine map[string]string
+			var clientSerial map[int64]int64
+			if d.Decode(&stateMachine) != nil ||
+			   d.Decode(&clientSerial) != nil {
+				log.Fatal("snapshot decode error")
+			} else {
+				kv.stateMachine = stateMachine
+				kv.clientSerial = clientSerial
+				kv.applyIndex = msg.CommandIndex
+			}
+		} else {
+			cmd := msg.Command.(Op)
+			if msg.CommandValid && cmd.SerialNumber > kv.clientSerial[cmd.ClientId] {
+				kv.clientSerial[cmd.ClientId] = cmd.SerialNumber
+				kv.applyIndex = msg.CommandIndex
+				DPrintf("Applied %s from %v (serial %v) at index %v", cmd.Op, cmd.ClientId, cmd.SerialNumber, msg.CommandIndex)
+				switch cmd.Op {
+				case GetOp:
+					break
+				case AppendOp:
+					{
+						if _, ok := kv.stateMachine[cmd.Key]; ok {
+							kv.stateMachine[cmd.Key] += cmd.Value
+						} else {
+							kv.stateMachine[cmd.Key] = cmd.Value
+						}
 					}
+				case PutOp:
+					kv.stateMachine[cmd.Key] = cmd.Value
 				}
-			case PutOp:
-				kv.stateMachine[cmd.Key] = cmd.Value
+			}
+			if kv.maxraftstate != -1 {
+				if stateSize := kv.rf.GetStateSize(); stateSize >= kv.maxraftstate {
+					w := new(bytes.Buffer)
+					e := labgob.NewEncoder(w)
+					e.Encode(kv.stateMachine)
+					e.Encode(kv.clientSerial)
+					data := w.Bytes()
+					kv.rf.TruncateLog(data, kv.applyIndex)
+				}
 			}
 		}
 		kv.mu.Unlock()
