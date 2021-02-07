@@ -5,13 +5,18 @@ package shardmaster
 //
 
 import "../labrpc"
+import "sync/atomic"
 import "time"
 import "crypto/rand"
 import "math/big"
 
+var idAlloc int64 = 0
+
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// Your data here.
+	id int64
+	serialAlloc int64
 }
 
 func nrand() int64 {
@@ -25,13 +30,22 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// Your code here.
+	ck.id = atomic.AddInt64(&idAlloc, 1)
 	return ck
+}
+
+func (ck *Clerk) allocSerial() Serial {
+	return Serial{
+		Number:   atomic.AddInt64(&ck.serialAlloc, 1),
+		ClientId: ck.id,
+	}
 }
 
 func (ck *Clerk) Query(num int) Config {
 	args := &QueryArgs{}
 	// Your code here.
 	args.Num = num
+	args.Serial = ck.allocSerial()
 	for {
 		// try each known server.
 		for _, srv := range ck.servers {
@@ -49,7 +63,7 @@ func (ck *Clerk) Join(servers map[int][]string) {
 	args := &JoinArgs{}
 	// Your code here.
 	args.Servers = servers
-
+	args.Serial = ck.allocSerial()
 	for {
 		// try each known server.
 		for _, srv := range ck.servers {
@@ -67,7 +81,7 @@ func (ck *Clerk) Leave(gids []int) {
 	args := &LeaveArgs{}
 	// Your code here.
 	args.GIDs = gids
-
+	args.Serial = ck.allocSerial()
 	for {
 		// try each known server.
 		for _, srv := range ck.servers {
@@ -86,7 +100,7 @@ func (ck *Clerk) Move(shard int, gid int) {
 	// Your code here.
 	args.Shard = shard
 	args.GID = gid
-
+	args.Serial = ck.allocSerial()
 	for {
 		// try each known server.
 		for _, srv := range ck.servers {
