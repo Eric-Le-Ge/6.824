@@ -14,6 +14,8 @@ const (
 	ErrNoKey       = "ErrNoKey"
 	ErrWrongGroup  = "ErrWrongGroup"
 	ErrWrongLeader = "ErrWrongLeader"
+	ErrOldRequest  = "ErrOldRequest"
+	ErrWait        = "ErrWait"
 )
 
 type Err string
@@ -27,6 +29,7 @@ type PutAppendArgs struct {
 	// You'll have to add definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	Serial Serial
 }
 
 type PutAppendReply struct {
@@ -36,9 +39,33 @@ type PutAppendReply struct {
 type GetArgs struct {
 	Key string
 	// You'll have to add definitions here.
+	Serial Serial
 }
 
 type GetReply struct {
 	Err   Err
 	Value string
 }
+
+type InstallShardArgs struct {
+	Shard int
+	ConfigNum int
+}
+
+type InstallShardReply struct {
+	Err Err
+	Data map[string]string
+	ClientSerial map[int64]int64
+}
+
+type Serial struct {
+	Number int64
+	ClientId int64
+}
+
+const (
+	GetOp = "Get"
+	PutOp = "Put"
+	AppendOp = "Append"
+	UpdateConfig = "UpdateConfig"
+)

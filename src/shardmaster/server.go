@@ -292,7 +292,9 @@ func (sm *ShardMaster) Query(args *QueryArgs, reply *QueryReply) {
 		if index == -1 {
 			reply.Config = sm.query(args)
 		} else {
+			sm.mu.Lock()
 			reply.Config = sm.queryResults[index]
+			sm.mu.Unlock()
 		}
 		reply.Err = OK
 	}

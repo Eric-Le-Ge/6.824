@@ -8,11 +8,14 @@ package shardkv
 // talks to the group that holds the key's shard.
 //
 
-import "../labrpc"
+import	"../labrpc"
+import	"sync/atomic"
 import "crypto/rand"
 import "math/big"
 import "../shardmaster"
 import "time"
+
+var idAlloc int64 = 0
 
 //
 // which shard is a key in?
@@ -40,6 +43,8 @@ type Clerk struct {
 	config   shardmaster.Config
 	make_end func(string) *labrpc.ClientEnd
 	// You will have to modify this struct.
+	id int64
+	serialAlloc int64
 }
 
 //
@@ -56,7 +61,15 @@ func MakeClerk(masters []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 	ck.sm = shardmaster.MakeClerk(masters)
 	ck.make_end = make_end
 	// You'll have to add code here.
+	ck.id = atomic.AddInt64(&idAlloc, 1)
 	return ck
+}
+
+func (ck *Clerk) allocSerial() Serial {
+	return Serial{
+		Number:   atomic.AddInt64(&ck.serialAlloc, 1),
+		ClientId: ck.id,
+	}
 }
 
 //
@@ -68,6 +81,7 @@ func MakeClerk(masters []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 func (ck *Clerk) Get(key string) string {
 	args := GetArgs{}
 	args.Key = key
+	args.Serial = ck.allocSerial()
 
 	for {
 		shard := key2shard(key)
@@ -82,6 +96,10 @@ func (ck *Clerk) Get(key string) string {
 					return reply.Value
 				}
 				if ok && (reply.Err == ErrWrongGroup) {
+					break
+				}
+				if ok && (reply.Err == ErrOldRequest) {
+					args.Serial = ck.allocSerial()
 					break
 				}
 				// ... not ok, or ErrWrongLeader
@@ -104,7 +122,7 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 	args.Key = key
 	args.Value = value
 	args.Op = op
-
+	args.Serial = ck.allocSerial()
 
 	for {
 		shard := key2shard(key)
@@ -115,10 +133,14 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 				var reply PutAppendReply
 				ok := srv.Call("ShardKV.PutAppend", &args, &reply)
 				if ok && reply.Err == OK {
+					DPrintf("[%v, %v] reports success, k v %v %v", si, gid, key, value)
 					return
 				}
 				if ok && reply.Err == ErrWrongGroup {
 					break
+				}
+				if ok && (reply.Err == ErrOldRequest) {
+					return
 				}
 				// ... not ok, or ErrWrongLeader
 			}
