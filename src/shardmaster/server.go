@@ -88,6 +88,9 @@ func (g gidShardCounts) Len() int {
 }
 
 func (g gidShardCounts) Less(i, j int) bool {
+	if g[i].shardCount == g[j].shardCount {
+		return g[i].gid > g[j].gid
+	}
 	return g[i].shardCount > g[j].shardCount
 }
 
@@ -289,13 +292,13 @@ func (sm *ShardMaster) Query(args *QueryArgs, reply *QueryReply) {
 	reply.WrongLeader = !success
 	if success {
 		// if query is already applied
+		sm.mu.Lock()
 		if index == -1 {
 			reply.Config = sm.query(args)
 		} else {
-			sm.mu.Lock()
 			reply.Config = sm.queryResults[index]
-			sm.mu.Unlock()
 		}
+		sm.mu.Unlock()
 		reply.Err = OK
 	}
 }

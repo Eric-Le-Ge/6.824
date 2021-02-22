@@ -42,6 +42,11 @@ type Result struct {
 	Value string // for gets, include the value in the result
 }
 
+type Group struct {
+	Gid int      // gid of the group
+	Servers []string // servers in the group
+}
+
 type ShardKV struct {
 	mu           sync.Mutex
 	me           int
@@ -58,7 +63,7 @@ type ShardKV struct {
 	stateMachine map[string]string // state machine - an in memory map
 	historyState map[int]map[string]string // historical entries in state machine
 	historySerial map[int]map[int64]int64 // historical entries in state machine
-	historyNeed  map[int]map[int]int // historical entries needed by gid for garbage collection
+	historyNeed  map[int]map[int]Group // historical entries needed by gid for garbage collection
 	snapshotConfigNum int // highest config number present in snapshot for garbage collection
 	snapshotTracker map[int]map[string]int // tracker of snapshot progress in each machine for garbage collection
 	applyIndex   int // highest index that has been applied to the state machine
@@ -387,13 +392,16 @@ func (kv *ShardKV) operateGC() {
 			case <-time.After(ApplyWaitTimeOut):
 			}
 			kv.mu.Lock()
-			for num, shard2gid := range kv.historyNeed {
-				for shard, gid := range shard2gid {
-					clear := true
-					for _, snapshotNum := range kv.snapshotTracker[gid] {
-						if snapshotNum <= num {
-							clear = false
-							break
+			for num, shard2group := range kv.historyNeed {
+				for shard, group := range shard2group {
+					clear := len(group.Servers) == 0
+					if groupNums, ok := kv.snapshotTracker[group.Gid]; ok {
+						clear = true
+						for _, server := range group.Servers {
+							if snapshotNum, ok := groupNums[server]; !ok || snapshotNum <= num {
+								clear = false
+								break
+							}
 						}
 					}
 					if clear {
@@ -414,6 +422,38 @@ func (kv *ShardKV) operateGC() {
 }
 
 //
+// installs a snapshot. Called with lock held.
+//
+func (kv *ShardKV) installSnapshot(data []byte) {
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var stateMachine map[string]string
+	var clientSerial map[int64]int64
+	var currentConfig shardmaster.Config
+	var historyState map[int]map[string]string
+	var historySerial map[int]map[int64]int64
+	var historyNeed map[int]map[int]Group
+	if d.Decode(&stateMachine) != nil ||
+		d.Decode(&clientSerial) != nil ||
+		d.Decode(&currentConfig) != nil ||
+		d.Decode(&historyState) != nil ||
+		d.Decode(&historySerial) != nil ||
+		d.Decode(&historyNeed) != nil {
+		log.Fatal("snapshot decode error")
+	} else {
+		DPrintf("[%v %v] installs a snapshot", kv.me, kv.gid)
+		kv.stateMachine = stateMachine
+		kv.clientSerial = clientSerial
+		kv.currentConfig = currentConfig
+		kv.targetConfig = currentConfig
+		kv.historyState = historyState
+		kv.historySerial = historySerial
+		kv.historyNeed = historyNeed
+		kv.snapshotConfigNum = currentConfig.Num
+	}
+}
+
+//
 // a long running go routine that applies messages from ApplyChannel
 //
 func (kv *ShardKV) operateApply() {
@@ -421,39 +461,14 @@ func (kv *ShardKV) operateApply() {
 		if kv.killed() {return}
 		kv.mu.Lock()
 		if !msg.CommandValid {
-			r := bytes.NewBuffer(msg.Command.([]byte))
-			d := labgob.NewDecoder(r)
-			var stateMachine map[string]string
-			var clientSerial map[int64]int64
-			var currentConfig shardmaster.Config
-			var historyState map[int]map[string]string
-			var historySerial map[int]map[int64]int64
-			var historyNeed map[int]map[int]int
-			if d.Decode(&stateMachine) != nil ||
-				d.Decode(&clientSerial) != nil ||
-				d.Decode(&currentConfig) != nil ||
-				d.Decode(&historyState) != nil ||
-				d.Decode(&historySerial) != nil ||
-				d.Decode(&historyNeed) != nil {
-				log.Fatal("snapshot decode error")
-			} else {
-				// make sure we don't install a snapshot in the middle of a config update
-				for kv.currentConfig.Num != kv.targetConfig.Num {
-					kv.mu.Unlock()
-					time.Sleep(WaitPollInterval)
-					kv.mu.Lock()
-				}
-				DPrintf("[%v %v] installs a snapshot", kv.me, kv.gid)
-				kv.stateMachine = stateMachine
-				kv.clientSerial = clientSerial
-				kv.currentConfig = currentConfig
-				kv.targetConfig = currentConfig
-				kv.historyState = historyState
-				kv.historySerial = historySerial
-				kv.historyNeed = historyNeed
-				kv.snapshotConfigNum = currentConfig.Num
-				kv.applyIndex = msg.CommandIndex
+			// make sure we don't install a snapshot in the middle of a config update
+			for kv.currentConfig.Num != kv.targetConfig.Num {
+				kv.mu.Unlock()
+				time.Sleep(WaitPollInterval)
+				kv.mu.Lock()
 			}
+			kv.installSnapshot(msg.Command.([]byte))
+			kv.applyIndex = msg.CommandIndex
 		} else {
 			cmd := msg.Command.(Op)
 			if cmd.Op == GetOp || cmd.Op == PutOp || cmd.Op == AppendOp {
@@ -524,9 +539,12 @@ func (kv *ShardKV) operateApply() {
 								kv.historyState[kv.currentConfig.Num] = make(map[string]string)
 							}
 							if value, ok := kv.historyNeed[kv.currentConfig.Num]; !ok || value == nil {
-								kv.historyNeed[kv.currentConfig.Num] = make(map[int]int)
+								kv.historyNeed[kv.currentConfig.Num] = make(map[int]Group)
 							}
-							kv.historyNeed[kv.currentConfig.Num][shard] = kv.targetConfig.Shards[shard]
+							kv.historyNeed[kv.currentConfig.Num][shard] = Group{
+								Gid:     kv.targetConfig.Shards[shard],
+								Servers: kv.targetConfig.Groups[kv.targetConfig.Shards[shard]],
+							}
 							if v, ok := kv.snapshotTracker[kv.targetConfig.Shards[shard]]; !ok || v == nil {
 								kv.snapshotTracker[kv.targetConfig.Shards[shard]] = make(map[string]int)
 							}
@@ -625,6 +643,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	labgob.Register(Op{})
 	labgob.Register(shardmaster.Config{})
 	labgob.Register(Serial{})
+	labgob.Register(Group{})
 
 	kv := new(ShardKV)
 	kv.me = me
@@ -634,10 +653,8 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.masters = masters
 
 	// Your initialization code here.
-
-	// Use something like this to talk to the shardmaster:
+	kv.mu.Lock()
 	kv.mck = shardmaster.MakeClerk(kv.masters)
-
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 	kv.currentConfig = shardmaster.Config{
@@ -645,7 +662,7 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	}
 	kv.historyState = make(map[int]map[string]string)
 	kv.historySerial = make(map[int]map[int64]int64)
-	kv.historyNeed = make(map[int]map[int]int)
+	kv.historyNeed = make(map[int]map[int]Group)
 	kv.snapshotTracker = make(map[int]map[string]int)
 	kv.targetConfig = kv.currentConfig
 	kv.doneCh = make(map[int]chan Result)
@@ -653,12 +670,17 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.clientSerial = make(map[int64]int64)
 	kv.blockShard = make(map[int]bool)
 	DPrintf("[%v %v] (Re)Starts", kv.me, kv.gid)
+	data := persister.ReadSnapshot()
+	if len(data) > 0 {
+		kv.installSnapshot(data)
+	}
 
 	go kv.operateApply()
 	go kv.operateConfig()
 	if maxraftstate != -1 {
 		go kv.operateGC()
 	}
+	kv.mu.Unlock()
 
 	return kv
 }
