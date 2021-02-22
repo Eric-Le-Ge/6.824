@@ -58,6 +58,12 @@ type InstallShardReply struct {
 	ClientSerial map[int64]int64
 }
 
+type QuerySnapshotNumArgs struct {}
+
+type QuerySnapshotNumReply struct {
+	Num int
+}
+
 type Serial struct {
 	Number int64
 	ClientId int64
@@ -68,4 +74,5 @@ const (
 	PutOp = "Put"
 	AppendOp = "Append"
 	UpdateConfig = "UpdateConfig"
+	GCOp = "GC"
 )

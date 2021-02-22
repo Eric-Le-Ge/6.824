@@ -1,17 +1,14 @@
 package shardkv
 
 
-// import "../shardmaster"
-import (
-	"../labrpc"
-	"bytes"
-	"log"
-	"sync/atomic"
-	"time"
-)
-import "../raft"
+import "bytes"
+import "log"
+import "sync/atomic"
 import "sync"
+import "time"
+import "../raft"
 import "../labgob"
+import "../labrpc"
 import "../shardmaster"
 
 const Debug = 0
@@ -31,9 +28,10 @@ type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
-	Op    string // "Put" or "Append" or "Get" or "Config"
+	Op    string // "Put" or "Append" or "Get" or "Config" or "GC"
 	Key   string
 	Value string
+	Shard int // used for GC
 	Config shardmaster.Config
 	SerialNumber int64 // used to prevent duplicate requests.
 	ClientId     int64 // used to prevent duplicate requests.
@@ -60,6 +58,9 @@ type ShardKV struct {
 	stateMachine map[string]string // state machine - an in memory map
 	historyState map[int]map[string]string // historical entries in state machine
 	historySerial map[int]map[int64]int64 // historical entries in state machine
+	historyNeed  map[int]map[int]int // historical entries needed by gid for garbage collection
+	snapshotConfigNum int // highest config number present in snapshot for garbage collection
+	snapshotTracker map[int]map[string]int // tracker of snapshot progress in each machine for garbage collection
 	applyIndex   int // highest index that has been applied to the state machine
 	clientSerial map[int64]int64 // highest processed serial number of client
 	doneCh       map[int]chan Result // channel to send back apply status
@@ -198,6 +199,15 @@ func (kv *ShardKV) InstallShard(args *InstallShardArgs, reply *InstallShardReply
 }
 
 //
+// Rpc to ask for snapshot number for garbage collection.
+//
+func (kv *ShardKV) QuerySnapshotNum(args *QuerySnapshotNumArgs, reply *QuerySnapshotNumReply) {
+	kv.mu.Lock()
+	reply.Num = kv.snapshotConfigNum
+	kv.mu.Unlock()
+}
+
+//
 // the tester calls Kill() when a ShardKV instance won't
 // be needed again. you are not required to do anything
 // in Kill(), but it might be convenient to (for example)
@@ -225,8 +235,12 @@ func (kv *ShardKV) saveSnapshot() {
 	e.Encode(kv.currentConfig)
 	e.Encode(kv.historyState)
 	e.Encode(kv.historySerial)
+	e.Encode(kv.historyNeed)
 	data := w.Bytes()
 	kv.rf.TruncateLog(data, kv.applyIndex)
+	if kv.currentConfig.Num > kv.snapshotConfigNum {
+		kv.snapshotConfigNum = kv.currentConfig.Num
+	}
 }
 
 //
@@ -329,6 +343,76 @@ func (kv *ShardKV) operateConfig() {
 	}
 }
 
+func (kv *ShardKV) querySnapshotNum(wg *sync.WaitGroup, server string, gid int) {
+	srv := kv.make_end(server)
+	var reply QuerySnapshotNumReply
+	ok := srv.Call("ShardKV.QuerySnapshotNum", &QuerySnapshotNumArgs{}, &reply)
+	if ok {
+		kv.mu.Lock()
+		if _, ok := kv.snapshotTracker[gid]; !ok {
+			kv.snapshotTracker[gid] = make(map[string]int)
+		}
+		if reply.Num > kv.snapshotTracker[gid][server] {
+			kv.snapshotTracker[gid][server] = reply.Num
+		}
+		kv.mu.Unlock()
+	}
+	wg.Done()
+}
+
+//
+// a long running go routine that garbage collects histories
+//
+func (kv *ShardKV) operateGC() {
+	for !kv.killed() {
+		kv.mu.Lock()
+		_, isLeader := kv.rf.GetState()
+		if isLeader {
+			// refresh snapshot nums for each server
+			var wg sync.WaitGroup
+			for gid, servers := range kv.currentConfig.Groups {
+				for _, server := range servers {
+					wg.Add(1)
+					go kv.querySnapshotNum(&wg, server, gid)
+				}
+			}
+			kv.mu.Unlock()
+			c := make(chan struct{})
+			go func() {
+				defer close(c)
+				wg.Wait()
+			}()
+			select {
+			case <-c:
+			case <-time.After(ApplyWaitTimeOut):
+			}
+			kv.mu.Lock()
+			for num, shard2gid := range kv.historyNeed {
+				for shard, gid := range shard2gid {
+					clear := true
+					for _, snapshotNum := range kv.snapshotTracker[gid] {
+						if snapshotNum <= num {
+							clear = false
+							break
+						}
+					}
+					if clear {
+						kv.rf.Start(Op{
+							Op:           GCOp,
+							Shard:        shard,
+							Config:       shardmaster.Config{
+								Num: num,
+							},
+						})
+					}
+				}
+			}
+		}
+		kv.mu.Unlock()
+		time.Sleep(ApplyWaitTimeOut)
+	}
+}
+
 //
 // a long running go routine that applies messages from ApplyChannel
 //
@@ -344,11 +428,13 @@ func (kv *ShardKV) operateApply() {
 			var currentConfig shardmaster.Config
 			var historyState map[int]map[string]string
 			var historySerial map[int]map[int64]int64
+			var historyNeed map[int]map[int]int
 			if d.Decode(&stateMachine) != nil ||
 				d.Decode(&clientSerial) != nil ||
 				d.Decode(&currentConfig) != nil ||
 				d.Decode(&historyState) != nil ||
-				d.Decode(&historySerial) != nil {
+				d.Decode(&historySerial) != nil ||
+				d.Decode(&historyNeed) != nil {
 				log.Fatal("snapshot decode error")
 			} else {
 				// make sure we don't install a snapshot in the middle of a config update
@@ -364,6 +450,8 @@ func (kv *ShardKV) operateApply() {
 				kv.targetConfig = currentConfig
 				kv.historyState = historyState
 				kv.historySerial = historySerial
+				kv.historyNeed = historyNeed
+				kv.snapshotConfigNum = currentConfig.Num
 				kv.applyIndex = msg.CommandIndex
 			}
 		} else {
@@ -435,6 +523,18 @@ func (kv *ShardKV) operateApply() {
 							if value, ok := kv.historyState[kv.currentConfig.Num]; !ok || value == nil {
 								kv.historyState[kv.currentConfig.Num] = make(map[string]string)
 							}
+							if value, ok := kv.historyNeed[kv.currentConfig.Num]; !ok || value == nil {
+								kv.historyNeed[kv.currentConfig.Num] = make(map[int]int)
+							}
+							kv.historyNeed[kv.currentConfig.Num][shard] = kv.targetConfig.Shards[shard]
+							if v, ok := kv.snapshotTracker[kv.targetConfig.Shards[shard]]; !ok || v == nil {
+								kv.snapshotTracker[kv.targetConfig.Shards[shard]] = make(map[string]int)
+							}
+							for _, server := range kv.targetConfig.Groups[kv.targetConfig.Shards[shard]] {
+								if _, ok := kv.snapshotTracker[kv.targetConfig.Shards[shard]][server]; !ok {
+									kv.snapshotTracker[kv.targetConfig.Shards[shard]][server] = 0
+								}
+							}
 							var kset []string
 							for k, _ := range kv.stateMachine {
 								if key2shard(k) == shard {
@@ -445,14 +545,35 @@ func (kv *ShardKV) operateApply() {
 								kv.historyState[kv.currentConfig.Num][k] = kv.stateMachine[k]
 								delete(kv.stateMachine, k)
 							}
+							if _, ok := kv.historySerial[kv.currentConfig.Num]; !ok {
+								serialCopy := map[int64]int64{}
+								for k, v := range kv.clientSerial {
+									serialCopy[k] = v
+								}
+								kv.historySerial[kv.currentConfig.Num] = serialCopy
+							}
 						}
 					}
-					serialCopy := map[int64]int64{}
-					for k, v := range kv.clientSerial {
-						serialCopy[k] = v
-					}
-					kv.historySerial[kv.currentConfig.Num] = serialCopy
 					go kv.updateConfig()
+				}
+			} else if cmd.Op == GCOp {
+				kv.applyIndex = msg.CommandIndex
+				if shard2gid, ok := kv.historyNeed[cmd.Config.Num]; ok {
+					delete(shard2gid, cmd.Shard)
+					if len(shard2gid) == 0 {
+						delete(kv.historyNeed, cmd.Config.Num)
+					}
+				}
+				if stateMachine, ok := kv.historyState[cmd.Config.Num]; ok {
+					for k := range stateMachine {
+						if key2shard(k) == cmd.Shard {
+							delete(stateMachine, k)
+						}
+					}
+					if len(stateMachine) == 0 {
+						delete(kv.historyState, cmd.Config.Num)
+						delete(kv.historySerial, cmd.Config.Num)
+					}
 				}
 			} else {
 				log.Fatalf("Unrecognized Op: %v", cmd.Op)
@@ -524,6 +645,8 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	}
 	kv.historyState = make(map[int]map[string]string)
 	kv.historySerial = make(map[int]map[int64]int64)
+	kv.historyNeed = make(map[int]map[int]int)
+	kv.snapshotTracker = make(map[int]map[string]int)
 	kv.targetConfig = kv.currentConfig
 	kv.doneCh = make(map[int]chan Result)
 	kv.stateMachine = make(map[string]string)
@@ -533,6 +656,9 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 
 	go kv.operateApply()
 	go kv.operateConfig()
+	if maxraftstate != -1 {
+		go kv.operateGC()
+	}
 
 	return kv
 }
