@@ -133,7 +133,6 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 				var reply PutAppendReply
 				ok := srv.Call("ShardKV.PutAppend", &args, &reply)
 				if ok && reply.Err == OK {
-					DPrintf("[%v, %v] reports success, k v %v %v", si, gid, key, value)
 					return
 				}
 				if ok && reply.Err == ErrWrongGroup {

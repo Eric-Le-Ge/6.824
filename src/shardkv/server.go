@@ -11,18 +11,10 @@ import "../labgob"
 import "../labrpc"
 import "../shardmaster"
 
-const Debug = 0
 const ApplyWaitTimeOut = 480 * time.Millisecond
 const ApplySendTimeOut = 20 * time.Millisecond
 const WaitPollInterval = 20 * time.Millisecond
 const ClientPollInterval = 100 * time.Millisecond
-
-func DPrintf(format string, a ...interface{}) (n int, err error) {
-	if Debug > 0 {
-		log.Printf(format, a...)
-	}
-	return
-}
 
 type Op struct {
 	// Your definitions here.
@@ -132,8 +124,6 @@ func (kv *ShardKV) Get(args *GetArgs, reply *GetReply) {
 			if reply.Err == OK || reply.Err == ErrNoKey {
 				reply.Value = result.Value
 			}
-			DPrintf("[%v %v] Handled Read from %v", kv.me, kv.gid, args.Serial)
-			DPrintf("[%v %v] k v %v %v", kv.me, kv.gid, args.Key, reply.Value)
 			kv.mu.Unlock()
 		}
 		case <- time.After(ApplyWaitTimeOut): {
@@ -147,8 +137,6 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	kv.mu.Lock()
 	term, index, err := kv.validateAndStart(args.Serial, args.Key, args.Value, args.Op)
 	reply.Err = err
-	DPrintf("[%v %v] Received %s from %v", kv.me, kv.gid, args.Op, args.Serial)
-	DPrintf("[%v %v] Received k v %v, %v", kv.me, kv.gid, args.Key, args.Value)
 	if err != OK {
 		kv.mu.Unlock()
 		return
@@ -170,8 +158,6 @@ func (kv *ShardKV) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 			// accessing a shard after it no longer belongs to
 			// this group
 			reply.Err = result.Err
-			DPrintf("[%v %v] Handled %s from %v", kv.me, kv.gid, args.Op, args.Serial)
-			DPrintf("[%v %v] Handled k v %v, %v", kv.me, kv.gid, args.Key, args.Value)
 			kv.mu.Unlock()
 		}
 		case <- time.After(ApplyWaitTimeOut): {
@@ -299,7 +285,6 @@ func (kv *ShardKV) installShard(shard int, wg *sync.WaitGroup) {
 //
 func (kv *ShardKV) updateConfig() {
 	kv.mu.Lock()
-	DPrintf("[%v %v] targets update %v", kv.me, kv.gid, kv.targetConfig)
 	defer kv.mu.Unlock()
 	var wg sync.WaitGroup
 	for shard := 0; shard < len(kv.targetConfig.Shards); shard++ {
@@ -312,7 +297,6 @@ func (kv *ShardKV) updateConfig() {
 	wg.Wait()
 	kv.mu.Lock()
 	kv.currentConfig = kv.targetConfig
-	DPrintf("[%v %v] completes update %v, statemachine %v", kv.me, kv.gid, kv.currentConfig, kv.stateMachine)
 }
 
 func (kv *ShardKV) operateConfig() {
@@ -441,7 +425,6 @@ func (kv *ShardKV) installSnapshot(data []byte) {
 		d.Decode(&historyNeed) != nil {
 		log.Fatal("snapshot decode error")
 	} else {
-		DPrintf("[%v %v] installs a snapshot", kv.me, kv.gid)
 		kv.stateMachine = stateMachine
 		kv.clientSerial = clientSerial
 		kv.currentConfig = currentConfig
@@ -487,7 +470,6 @@ func (kv *ShardKV) operateApply() {
 						if kv.targetConfig.Shards[shard] == kv.gid {
 							result.Err = OK
 							kv.clientSerial[cmd.ClientId] = cmd.SerialNumber
-							DPrintf("[%v %v] Applied %s from %v (serial %v) at index %v", kv.me, kv.gid, cmd.Op, cmd.ClientId, cmd.SerialNumber, msg.CommandIndex)
 							switch cmd.Op {
 							case GetOp:
 								{
@@ -505,11 +487,9 @@ func (kv *ShardKV) operateApply() {
 									} else {
 										kv.stateMachine[cmd.Key] = cmd.Value
 									}
-									DPrintf("[%v %v] new k v %v %v", kv.me, kv.gid, cmd.Key, kv.stateMachine[cmd.Key])
 								}
 							case PutOp:
 								kv.stateMachine[cmd.Key] = cmd.Value
-								DPrintf("[%v %v] new k v %v %v", kv.me, kv.gid, cmd.Key, kv.stateMachine[cmd.Key])
 							}
 						}
 						doneCh := kv.doneCh[msg.CommandIndex]
@@ -526,7 +506,6 @@ func (kv *ShardKV) operateApply() {
 					for kv.currentConfig.Num != kv.targetConfig.Num {
 						kv.mu.Unlock()
 						time.Sleep(WaitPollInterval)
-						DPrintf("Wait for previous update")
 						kv.mu.Lock()
 					}
 					kv.applyIndex = msg.CommandIndex
@@ -669,7 +648,6 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister,
 	kv.stateMachine = make(map[string]string)
 	kv.clientSerial = make(map[int64]int64)
 	kv.blockShard = make(map[int]bool)
-	DPrintf("[%v %v] (Re)Starts", kv.me, kv.gid)
 	data := persister.ReadSnapshot()
 	if len(data) > 0 {
 		kv.installSnapshot(data)
